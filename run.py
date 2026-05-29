@@ -6,8 +6,8 @@ import sys
 import os
 
 def kill_ghosts():
-    print("🧹 Cleaning up ghost processes on ports 8501/8502/8503/8000...")
-    os.system("pkill -9 -f 'streamlit run'")
+    print("🧹 Cleaning up ghost processes on ports 3000/8000...")
+    os.system("pkill -9 -f 'npm run dev'")
     os.system("pkill -9 -f 'uvicorn'")
     time.sleep(1)
 
@@ -27,14 +27,15 @@ def start_idcs():
     # Give the backend 2 seconds to bind the port
     time.sleep(2)
 
-    # 2. Start the Streamlit Frontend
+    # 2. Start the React Frontend
     frontend_process = subprocess.Popen(
-        [sys.executable, "-m", "streamlit", "run", "app.py", "--server.address", "0.0.0.0", "--server.port", "8503"],
+        ["npm", "run", "dev"],
+        cwd=os.path.join(os.getcwd(), "frontend"),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True
     )
-    print("✅ Frontend initiating on http://localhost:8503")
+    print("✅ Frontend initiating on http://localhost:3000")
 
     print("\n💡 System is LIVE. Press Ctrl+C to shut down both.")
 

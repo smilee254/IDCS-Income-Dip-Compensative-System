@@ -1,0 +1,31 @@
+# Virtual Environments
+.venve/
+env/
+venv/
+.venv/
+ENV/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Databases & Local Data (untrack local DBs if necessary, but idcs.db is tracked. We will leave it as-is unless specified)
+# idcs.db
+
+# Logs
+*.log
+app.log
+server.log
+stream.out
+
+# Temp statement uploads
+temp_mpesa_*.pdf
+temp_bank_*.pdf
+
+# Node / Frontend (handled inside frontend/.gitignore, but good as fallback)
+frontend/node_modules/
+frontend/dist/
+frontend/build_error.log

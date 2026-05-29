@@ -56,12 +56,15 @@ class IDCS_Engine:
             
         return predictions, risk_score, (model, forecast)
 
-    def calculate_metrics(self, income_history, src_cap, current_income, w_emp=1.0):
+    def calculate_metrics(self, income_history, src_cap, current_income, w_emp=1.0, transaction_count=15, sector_dip=0.0, squad_no_claim_bonus=False, severe_weather_event=False):
         """
-        income_history: list of dicts with 'amount' and 'status'
+        income_history: list of dicts with 'amount', 'status', and optionally 'category'
+        Filters out irregular inflows (Loans, P2P, Chamas) before calculation.
         """
-        amounts = [record['amount'] for record in income_history]
-        statuses = [record['status'] for record in income_history]
+        # 1. Filter Irregular Inflows (Transaction Metadata Isolation)
+        valid_history = [r for r in income_history if r.get('category', 'Revenue') not in ['Loan', 'Chama', 'P2P_Transfer']]
+        amounts = [record['amount'] for record in valid_history]
+        statuses = [record['status'] for record in valid_history]
 
         # 1. Mean Income (mu)
         mu = np.mean(amounts) if len(amounts) > 0 else 0
@@ -113,33 +116,79 @@ class IDCS_Engine:
 
         current_dip_detected = bool(current_income < dip_threshold)
 
-        # 3. Stability Score (S)
+        # 3. Stability Score (S) heavily weighted by Transaction Velocity
+        velocity_score = min(100.0, (transaction_count / 30.0) * 100.0)
         unpaid_months = statuses.count("Unpaid")
         p_unpaid = 5 * unpaid_months
         
         if mu > 0:
+            # 60% based on variance, 40% based on velocity
             s_base = 100 * (1 - (sigma / mu)) * w_emp
-            stability_score = max(0, s_base - p_unpaid)
+            blended_s_base = (s_base * 0.6) + (velocity_score * 0.4)
+            stability_score = max(0.0, blended_s_base - p_unpaid)
         else:
-            stability_score = 0
+            stability_score = 0.0
+
+        # Activity Verification (Moral Hazard Prevention)
+        is_active_business = transaction_count > 0
+
+        # Sector-Level Corroboration & Weather Oracle
+        personal_dip_pct = ((mu - current_income) / mu) if mu > 0 else 0
+        needs_manual_audit = False
+        if personal_dip_pct > 0.3 and sector_dip < 0.05:
+            if not severe_weather_event:
+                # High personal dip, no macro dip, no extreme weather -> flag for audit
+                needs_manual_audit = True
+            # If there IS a severe weather event, bypass audit (Parametric Oracle)
+
+        # Gamification Level
+        financial_level = 1
+        if velocity_score > 90:
+            financial_level = 3
+        elif velocity_score > 50:
+            financial_level = 2
 
         # Eligibility
         paid_months = statuses.count("Paid")
-        eligible = bool(current_dip_detected and paid_months >= 3 and stability_score >= 50)
+        eligible = bool(current_dip_detected and paid_months >= 3 and stability_score >= 50 and is_active_business and not needs_manual_audit)
+        
+        # Auto-Disbursement Trigger
+        auto_disburse = False
+        if eligible and (sector_dip > 0.2 or severe_weather_event) and velocity_score > 80:
+            auto_disburse = True
 
-        # Predicted Compensation (Capped at 70% of Mean income)
+        # Predicted Compensation (Partial Indemnity / Co-insurance)
         predicted_compensation = 0.0
         if eligible:
-            payout = min(src_cap, 0.70 * mu)
-            predicted_compensation = max(0, payout)
+            verified_dip = max(0.0, float(mu - current_income))
+            co_insurance_cap = 0.70  # Pool pays max 70% of the loss to retain worker incentive
+            payout = min(src_cap, verified_dip * co_insurance_cap)
+            predicted_compensation = max(0.0, payout)
+
+        # Embedded Micro-Premium Rate
+        base_rate = 0.015 if stability_score > 70 else 0.025
+        
+        # Gamification & Squad Discounts
+        if financial_level == 3:
+            base_rate -= 0.002  # Level 3 discount
+        if squad_no_claim_bonus:
+            base_rate -= 0.003  # Trust Squad Dividend
+            
+        micro_deduction_rate = max(0.005, base_rate)
 
         return {
             "mu": float(mu),
             "sigma": float(sigma),
             "stability_score": float(stability_score),
+            "velocity_score": float(velocity_score),
+            "financial_level": int(financial_level),
+            "micro_deduction_rate": float(micro_deduction_rate),
+            "auto_disburse": auto_disburse,
             "dip_detected": current_dip_detected,
             "eligible": eligible,
             "payout": float(predicted_compensation),
+            "needs_manual_audit": needs_manual_audit,
+            "is_active_business": is_active_business,
             "paid_months": paid_months,
             "unpaid_months": unpaid_months,
             "dip_probability": float(dip_probability),

@@ -29,6 +29,7 @@ def get_db():
 class IncomeData(BaseModel):
     amount: float
     status: str
+    category: str = "Revenue"
 
 class UserRequest(BaseModel):
     name: str
@@ -43,6 +44,10 @@ class EvaluationRequest(BaseModel):
     income_history: list[IncomeData]
     premium: float = 0.0
     deferred_period: int = 30
+    transaction_count: int = 15
+    sector_dip: float = 0.0
+    squad_no_claim_bonus: bool = False
+    severe_weather_event: bool = False
 
 class ChatRequest(BaseModel):
     system_prompt: str
@@ -118,9 +123,9 @@ def evaluate_claim(req: EvaluationRequest, db: Session = Depends(get_db)):
     db.refresh(user)
 
 
-    # Use exact history provided in st.session_state (CSV)
+    # Use exact history provided
     income_history_data = [
-        {"amount": inc.amount, "status": inc.status}
+        {"amount": inc.amount, "status": inc.status, "category": inc.category}
         for inc in req.income_history
     ]
 
@@ -130,7 +135,11 @@ def evaluate_claim(req: EvaluationRequest, db: Session = Depends(get_db)):
         income_history=income_history_data,
         src_cap=user.src_cap,
         current_income=req.current_income,
-        w_emp=w_emp
+        w_emp=w_emp,
+        transaction_count=req.transaction_count,
+        sector_dip=req.sector_dip,
+        squad_no_claim_bonus=req.squad_no_claim_bonus,
+        severe_weather_event=req.severe_weather_event
     )
 
     return {
@@ -144,8 +153,34 @@ def evaluate_claim(req: EvaluationRequest, db: Session = Depends(get_db)):
         "income_history": income_history_data
     }
 
+class WebhookPayload(BaseModel):
+    user_id: int
+    amount: float
+    transaction_type: str
+    timestamp: str
+
+@app.post("/webhook/daraja")
+def daraja_webhook(payload: WebhookPayload, db: Session = Depends(get_db)):
+    """
+    Simulated Webhook to receive real-time transactional data from Open Banking or Telco (e.g. Safaricom Daraja).
+    Instead of relying on PDF uploads, data streams directly into the engine, updating transaction velocity and the user's risk profile dynamically.
+    """
+    # Logic to record the transaction, increment velocity_score, and deduct the micro-premium percentage.
+    return {"status": "success", "message": "Transaction recorded for Velocity Scoring. Micro-premium automatically deducted."}
+
 @app.post("/chat")
 def chat_endpoint(req: ChatRequest):
+    """ IDCS AI Copilot Module """
+    user_prompt = req.messages[-1].get("content", "").lower()
+    
+    # Simple simulated Copilot intelligence
+    if "velocity" in user_prompt or "improve" in user_prompt:
+        response = "IDCS Copilot: I noticed your transaction velocity is decent, but 60% of your earnings occur on weekends. Try working Thursday nights to boost your velocity score above 90. This will upgrade you to Level 3 and reduce your micro-premium deduction!"
+    elif "squad" in user_prompt or "trust" in user_prompt:
+        response = "IDCS Copilot: Joining a Trust Squad is highly recommended. If you and 4 peers maintain zero suspicious claims for a year, your micro-premium rate will drop by 0.3%."
+    else:
+        response = "IDCS Copilot: I am your proactive financial advisor. I monitor your daily transaction flows to help you stabilize your income before a dip occurs. How can I help you optimize your business today?"
+        
     return {
-        "content": "Jambo! I am the IDCS Smart Broker responding locally. Based on your inputs and M-Pesa data, I recommend Britam Family Income Protection with an 88% match because your history indicates high volatility that this plan specifically covers with inflation-adjusted monthly payouts.\\n\\n[Analyze Income] -> [Identify Risk Category] -> [Match Scheme]"
+        "content": response
     }
