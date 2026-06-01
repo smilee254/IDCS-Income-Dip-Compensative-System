@@ -283,6 +283,17 @@ tr:last-child td {
   color: var(--danger);
 }
 
+.badge-warning {
+  background-color: rgba(245, 166, 35, 0.12);
+  color: var(--warning);
+}
+
+.badge-secondary {
+  background-color: rgba(158, 158, 167, 0.08);
+  color: var(--text-muted);
+  border: 1px solid var(--border-color);
+}
+
 .pricing-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;

@@ -6,55 +6,177 @@ class IDCS_Engine:
     def __init__(self):
         pass
 
-    def predict_risk_horizon(self, df_monthly, mu):
+    def prepare_monthly_df(self, income_history):
         """
-        Time-Series Forecasting using Prophet for the next 6 months.
+        Convert income_history list to a Prophet-ready monthly DataFrame.
+        Strips non-revenue inflows (Loans, Chamas, P2P) and assigns
+        synthetic calendar months ending at the current month.
+        """
+        valid = [r for r in income_history
+                 if r.get('category', 'Revenue') not in ['Loan', 'Chama', 'P2P_Transfer']]
+        amounts = [r['amount'] for r in valid]
+        n = len(amounts)
+        if n == 0:
+            return pd.DataFrame(columns=['month', 'Total Income'])
+
+        # item[n-1] = this month, item[n-2] = last month, etc.
+        import datetime
+        today = datetime.date.today()
+        months = []
+        for i in range(n - 1, -1, -1):
+            m = today.month - i
+            y = today.year
+            while m <= 0:
+                m += 12
+                y -= 1
+            months.append(f"{y}-{m:02d}")
+
+        return pd.DataFrame({'month': months, 'Total Income': amounts})
+
+    def _kenyan_holidays(self):
+        """Kenyan public holidays + school-fee income spikes for Prophet."""
+        import datetime
+        yr = datetime.date.today().year
+        rows = []
+        for y in [yr, yr + 1]:
+            rows.extend([
+                {'holiday': 'New Year',       'ds': f'{y}-01-01', 'lower_window': -1, 'upper_window': 2},
+                {'holiday': 'Labour Day',     'ds': f'{y}-05-01', 'lower_window': -1, 'upper_window': 1},
+                {'holiday': 'Madaraka Day',   'ds': f'{y}-06-01', 'lower_window': -1, 'upper_window': 1},
+                {'holiday': 'Mashujaa Day',   'ds': f'{y}-10-20', 'lower_window': -1, 'upper_window': 1},
+                {'holiday': 'Jamhuri Day',    'ds': f'{y}-12-12', 'lower_window': -1, 'upper_window': 2},
+                {'holiday': 'Christmas',      'ds': f'{y}-12-25', 'lower_window': -2, 'upper_window': 3},
+                {'holiday': 'SchoolFees Jan', 'ds': f'{y}-01-10', 'lower_window': -3, 'upper_window': 5},
+                {'holiday': 'SchoolFees May', 'ds': f'{y}-05-05', 'lower_window': -3, 'upper_window': 5},
+                {'holiday': 'SchoolFees Sep', 'ds': f'{y}-09-05', 'lower_window': -3, 'upper_window': 5},
+            ])
+        return pd.DataFrame(rows)
+
+    def predict_risk_horizon(self, df_monthly, mu, sector_dip=0.0):
+        """
+        Prophet 6-month forecast — tuned for Kenyan gig economy.
+        Steps 1-3: adaptive seasonality, changepoint tuning, multiplicative mode.
+        Step 5: Kenyan holidays injected.
+        Step 6: sector_dip external regressor when provided.
         """
         if df_monthly.empty or mu <= 0:
             return [], 0, None
-            
-        # 1. Data Preparation for Prophet
-        # Expects df_monthly to have 'month' (YYYY-MM) and 'Total Income'
+
+        n = len(df_monthly)
         df_prophet = df_monthly.copy()
         df_prophet['ds'] = pd.to_datetime(df_prophet['month'])
         df_prophet = df_prophet.rename(columns={'Total Income': 'y'})
-        
-        # 2. Model Training
-        model = Prophet(yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
-        model.fit(df_prophet[['ds', 'y']])
-        
-        # 3. 6-Month Horizon Forecast
+
+        model = Prophet(
+            yearly_seasonality      = n >= 24,      # Step 1: only reliable with 2+ years
+            weekly_seasonality      = False,
+            daily_seasonality       = False,
+            seasonality_mode        = 'multiplicative',  # Step 1: scales with income level
+            changepoint_prior_scale = 0.15,         # Step 2: flexible trend for gig volatility
+            seasonality_prior_scale = 10.0,
+            interval_width          = 0.80,         # Step 3: explicit 80% confidence band
+            holidays                = self._kenyan_holidays(),  # Step 5
+        )
+
+        use_regressor = sector_dip > 0.0
+        if use_regressor:                           # Step 6
+            model.add_regressor('sector_dip')
+            df_prophet['sector_dip'] = sector_dip
+
+        fit_cols = ['ds', 'y'] + (['sector_dip'] if use_regressor else [])
+        model.fit(df_prophet[fit_cols])
+
         future = model.make_future_dataframe(periods=6, freq='MS')
+        if use_regressor:
+            future['sector_dip'] = sector_dip
         forecast = model.predict(future)
-        
-        # Extract predictions for the future 6 months
+
         predictions_df = forecast.tail(6).copy()
-        
-        # 4. Risk Scoring & Loading Factor
-        # Dip Event: yhat_lower < (Average_Income * 0.7)
         threshold = mu * 0.7
         predictions_df['is_high_risk'] = predictions_df['yhat_lower'] < threshold
-        
-        risk_events = predictions_df['is_high_risk'].sum()
-        # Risk Score (0-100) based on frequency and depth of predicted dips
-        # Simple score: 1 risk event = 15 points, maxed at 100
+
+        risk_events  = predictions_df['is_high_risk'].sum()
         depth_penalty = 0
         if risk_events > 0:
-            avg_dip_depth = (threshold - predictions_df[predictions_df['is_high_risk']]['yhat_lower']).mean()
-            depth_penalty = min(50, (avg_dip_depth / threshold) * 100)
-            
+            avg_depth   = (threshold - predictions_df[predictions_df['is_high_risk']]['yhat_lower']).mean()
+            depth_penalty = min(50, (avg_depth / threshold) * 100)
         risk_score = min(100, (risk_events * 10) + depth_penalty)
-        
+
         predictions = []
         for _, row in predictions_df.iterrows():
             predictions.append({
-                "month": row['ds'].strftime('%Y-%m'),
+                "month":            row['ds'].strftime('%Y-%m'),
                 "predicted_income": float(row['yhat']),
-                "predicted_lower": float(row['yhat_lower']),
-                "is_high_risk": bool(row['is_high_risk'])
+                "predicted_lower":  float(row['yhat_lower']),
+                "predicted_upper":  float(row['yhat_upper']),
+                "is_high_risk":     bool(row['is_high_risk']),
             })
-            
+
         return predictions, risk_score, (model, forecast)
+
+    def validate_forecast(self, df_monthly):
+        """Step 7: Prophet cross-validation — returns MAE, MAPE, RMSE."""
+        from prophet.diagnostics import cross_validation, performance_metrics
+        import warnings
+        warnings.filterwarnings('ignore')
+
+        if len(df_monthly) < 6:
+            return None, "Need >= 6 months of data."
+
+        df_p = df_monthly.copy()
+        df_p['ds'] = pd.to_datetime(df_p['month'])
+        df_p = df_p.rename(columns={'Total Income': 'y'})
+        n = len(df_p)
+
+        model = Prophet(
+            yearly_seasonality=n >= 24, weekly_seasonality=False, daily_seasonality=False,
+            seasonality_mode='multiplicative', changepoint_prior_scale=0.15, interval_width=0.80,
+            holidays=self._kenyan_holidays(),
+        )
+        model.fit(df_p[['ds', 'y']])
+        initial = str(max(90, int(n * 0.6 * 30))) + ' days'
+        df_cv   = cross_validation(model, initial=initial, period='30 days', horizon='180 days')
+        metrics = performance_metrics(df_cv)
+        return metrics[['horizon', 'mae', 'mape', 'rmse', 'coverage']].to_dict(orient='records'), None
+
+    def tune_hyperparameters(self, df_monthly):
+        """Step 8: Grid search over changepoint + seasonality priors. Returns best params by MAPE."""
+        from prophet.diagnostics import cross_validation, performance_metrics
+        from itertools import product
+        import warnings
+        warnings.filterwarnings('ignore')
+
+        if len(df_monthly) < 6:
+            return None, "Need >= 6 months."
+
+        df_p = df_monthly.copy()
+        df_p['ds'] = pd.to_datetime(df_p['month'])
+        df_p = df_p.rename(columns={'Total Income': 'y'})
+        n       = len(df_p)
+        initial = str(max(90, int(n * 0.6 * 30))) + ' days'
+
+        grid = list(product([0.05, 0.10, 0.15, 0.25], [5.0, 10.0, 20.0]))
+        best_mape, best_params, results = float('inf'), None, []
+
+        for cp, sp in grid:
+            try:
+                m = Prophet(
+                    yearly_seasonality=n >= 24, weekly_seasonality=False, daily_seasonality=False,
+                    seasonality_mode='multiplicative', changepoint_prior_scale=cp,
+                    seasonality_prior_scale=sp, interval_width=0.80,
+                )
+                m.fit(df_p[['ds', 'y']])
+                df_cv = cross_validation(m, initial=initial, period='30 days', horizon='90 days')
+                perf  = performance_metrics(df_cv)
+                mape  = float(perf['mape'].mean())
+                results.append({'changepoint_prior_scale': cp, 'seasonality_prior_scale': sp, 'mape': round(mape, 4)})
+                if mape < best_mape:
+                    best_mape   = mape
+                    best_params = {'changepoint_prior_scale': cp, 'seasonality_prior_scale': sp}
+            except Exception:
+                continue
+
+        return best_params, sorted(results, key=lambda x: x['mape'])
 
     def calculate_metrics(self, income_history, src_cap, current_income, w_emp=1.0, transaction_count=15, sector_dip=0.0, squad_no_claim_bonus=False, severe_weather_event=False):
         """

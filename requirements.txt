@@ -12,3 +12,5 @@ bcrypt
 passlib[bcrypt]
 pydantic
 google-generativeai
+python-jose[cryptography]
+python-multipart

@@ -2,8 +2,10 @@
 import subprocess
 import time
 import sys
-
 import os
+
+# Always use the project venv — works even if venv is not activated before launch
+VENV_PYTHON = os.path.join(os.path.dirname(__file__), "env", "bin", "python")
 
 def kill_ghosts():
     print("🧹 Cleaning up ghost processes on ports 3000/8000...")
@@ -17,7 +19,7 @@ def start_idcs():
 
     # 1. Start the FastAPI Backend
     backend_process = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"],
+        [VENV_PYTHON, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True
