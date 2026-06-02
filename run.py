@@ -23,6 +23,11 @@ def start_idcs():
     print("🚀 Starting IDCS System...")
 
     # 1. Start the FastAPI Backend
+    if not os.path.exists(VENV_PYTHON):
+        print(f"❌ Error: Could not find virtual environment at {VENV_PYTHON}")
+        print("Please run 'python -m venv env' to create it.")
+        sys.exit(1)
+
     backend_process = subprocess.Popen(
         [VENV_PYTHON, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"],
         stdout=subprocess.PIPE,
@@ -36,6 +41,13 @@ def start_idcs():
 
     # 2. Start the React Frontend
     npm_cmd = "npm.cmd" if os.name == 'nt' else "npm"
+    
+    import shutil
+    if not shutil.which(npm_cmd):
+        print("❌ Error: 'npm' is not installed or not in your PATH. Please install Node.js.")
+        backend_process.terminate()
+        sys.exit(1)
+
     frontend_process = subprocess.Popen(
         [npm_cmd, "run", "dev"],
         cwd=os.path.join(os.getcwd(), "frontend"),
