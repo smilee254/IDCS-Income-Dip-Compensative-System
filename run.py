@@ -4,13 +4,18 @@ import time
 import sys
 import os
 
-# Always use the project venv — works even if venv is not activated before launch
-VENV_PYTHON = os.path.join(os.path.dirname(__file__), "env", "bin", "python")
-
+if os.name == 'nt':
+    VENV_PYTHON = os.path.join(os.path.dirname(__file__), "env", "Scripts", "python.exe")
+else:
+    VENV_PYTHON = os.path.join(os.path.dirname(__file__), "env", "bin", "python")
 def kill_ghosts():
     print("🧹 Cleaning up ghost processes on ports 3000/8000...")
-    os.system("pkill -9 -f 'npm run dev'")
-    os.system("pkill -9 -f 'uvicorn'")
+    if os.name == 'nt':
+        os.system("taskkill /F /IM node.exe /T >nul 2>&1")
+        os.system("taskkill /F /IM uvicorn.exe /T >nul 2>&1")
+    else:
+        os.system("pkill -9 -f 'npm run dev'")
+        os.system("pkill -9 -f 'uvicorn'")
     time.sleep(1)
 
 def start_idcs():
@@ -30,8 +35,9 @@ def start_idcs():
     time.sleep(2)
 
     # 2. Start the React Frontend
+    npm_cmd = "npm.cmd" if os.name == 'nt' else "npm"
     frontend_process = subprocess.Popen(
-        ["npm", "run", "dev"],
+        [npm_cmd, "run", "dev"],
         cwd=os.path.join(os.getcwd(), "frontend"),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
