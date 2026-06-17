@@ -1,4 +1,4 @@
-# 📊 Actuarial Systems Auditor: Validation Report
+#  Actuarial Systems Auditor: Validation Report
 
 ## 1. Logic Consistency (Actuarial Validation)
 **What was broken:** 

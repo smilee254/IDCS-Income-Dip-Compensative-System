@@ -9,7 +9,7 @@ if os.name == 'nt':
 else:
     VENV_PYTHON = os.path.join(os.path.dirname(__file__), "env", "bin", "python")
 def kill_ghosts():
-    print("🧹 Cleaning up ghost processes on ports 3000/8000...")
+    print(" Cleaning up ghost processes on ports 3000/8000...")
     if os.name == 'nt':
         os.system("taskkill /F /IM node.exe /T >nul 2>&1")
         os.system("taskkill /F /IM uvicorn.exe /T >nul 2>&1")
@@ -20,11 +20,11 @@ def kill_ghosts():
 
 def start_idcs():
     kill_ghosts()
-    print("🚀 Starting IDCS System...")
+    print(" Starting IDCS System...")
 
     # 1. Start the FastAPI Backend
     if not os.path.exists(VENV_PYTHON):
-        print(f"❌ Error: Could not find virtual environment at {VENV_PYTHON}")
+        print(f" Error: Could not find virtual environment at {VENV_PYTHON}")
         print("Please run 'python -m venv env' to create it.")
         sys.exit(1)
 
@@ -34,7 +34,7 @@ def start_idcs():
         stderr=subprocess.STDOUT,
         text=True
     )
-    print("✅ Backend initiating on http://127.0.0.1:8000")
+    print(" Backend initiating on http://127.0.0.1:8000")
 
     # Give the backend 2 seconds to bind the port
     time.sleep(2)
@@ -44,7 +44,7 @@ def start_idcs():
     
     import shutil
     if not shutil.which(npm_cmd):
-        print("❌ Error: 'npm' is not installed or not in your PATH. Please install Node.js.")
+        print(" Error: 'npm' is not installed or not in your PATH. Please install Node.js.")
         backend_process.terminate()
         sys.exit(1)
 
@@ -55,19 +55,19 @@ def start_idcs():
         stderr=subprocess.STDOUT,
         text=True
     )
-    print("✅ Frontend initiating on http://localhost:3000")
+    print(" Frontend initiating on http://localhost:3000")
 
-    print("\n💡 System is LIVE. Press Ctrl+C to shut down both.")
+    print("\n System is LIVE. Press Ctrl+C to shut down both.")
 
     try:
         # Keep the script running to monitor processes
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\n🛑 Shutting down safely...")
+        print("\n Shutting down safely...")
         backend_process.terminate()
         frontend_process.terminate()
-        print("👋 Goodbye!")
+        print(" Goodbye!")
 
 if __name__ == "__main__":
     start_idcs()

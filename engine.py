@@ -1,10 +1,21 @@
 from prophet import Prophet
 import numpy as np
 import pandas as pd
+from functools import lru_cache
+from typing import Dict, Tuple
+import hashlib, json
 
 class IDCS_Engine:
     def __init__(self):
-        pass
+        # Per-user Prophet model cache: {cache_key: (model, forecast_df)}
+        # Key = (user_id, sha256_of_monthly_df) so stale data auto-invalidates
+        self._prophet_cache: Dict[str, Tuple] = {}
+        self._cache_max_size = 200   # evict LRU when over limit
+
+    def _data_hash(self, df_monthly: pd.DataFrame) -> str:
+        """SHA-256 fingerprint of the monthly DataFrame rows for cache keying."""
+        raw = df_monthly.to_json(orient="records", date_format="iso")
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     def prepare_monthly_df(self, income_history):
         """
@@ -33,6 +44,7 @@ class IDCS_Engine:
 
         return pd.DataFrame({'month': months, 'Total Income': amounts})
 
+    @lru_cache(maxsize=2)   # cached per year — rebuilds automatically next year
     def _kenyan_holidays(self):
         """Kenyan public holidays + school-fee income spikes for Prophet."""
         import datetime
@@ -52,15 +64,23 @@ class IDCS_Engine:
             ])
         return pd.DataFrame(rows)
 
-    def predict_risk_horizon(self, df_monthly, mu, sector_dip=0.0):
+    def predict_risk_horizon(self, df_monthly, mu, sector_dip=0.0, cache_key: str = ""):
         """
         Prophet 6-month forecast — tuned for Kenyan gig economy.
-        Steps 1-3: adaptive seasonality, changepoint tuning, multiplicative mode.
-        Step 5: Kenyan holidays injected.
-        Step 6: sector_dip external regressor when provided.
+        cache_key: if provided, result is cached per (cache_key, data_hash)
+          to avoid re-fitting Prophet on identical data.
         """
         if df_monthly.empty or mu <= 0:
             return [], 0, None
+
+        # ── Cache hit check ────────────────────────────────────────────
+        ck = None
+        if cache_key:
+            data_hash = self._data_hash(df_monthly)
+            ck = f"{cache_key}:{data_hash}:{sector_dip:.4f}"
+            if ck in self._prophet_cache:
+                cached = self._prophet_cache[ck]
+                return cached["predictions"], cached["risk_score"], cached["model_tuple"]
 
         n = len(df_monthly)
         df_prophet = df_monthly.copy()
@@ -93,26 +113,44 @@ class IDCS_Engine:
 
         predictions_df = forecast.tail(6).copy()
         threshold = mu * 0.7
-        predictions_df['is_high_risk'] = predictions_df['yhat_lower'] < threshold
+        # Vectorised risk computation (numpy, not Python loop)
+        lower = predictions_df["yhat_lower"].to_numpy()
+        predictions_df["is_high_risk"] = lower < threshold
 
-        risk_events  = predictions_df['is_high_risk'].sum()
+        risk_events   = int((lower < threshold).sum())
         depth_penalty = 0
-        if risk_events > 0:
-            avg_depth   = (threshold - predictions_df[predictions_df['is_high_risk']]['yhat_lower']).mean()
+        high_risk_lower = lower[lower < threshold]
+        if len(high_risk_lower):
+            avg_depth     = (threshold - high_risk_lower).mean()
             depth_penalty = min(50, (avg_depth / threshold) * 100)
         risk_score = min(100, (risk_events * 10) + depth_penalty)
 
-        predictions = []
-        for _, row in predictions_df.iterrows():
-            predictions.append({
-                "month":            row['ds'].strftime('%Y-%m'),
-                "predicted_income": float(row['yhat']),
-                "predicted_lower":  float(row['yhat_lower']),
-                "predicted_upper":  float(row['yhat_upper']),
-                "is_high_risk":     bool(row['is_high_risk']),
-            })
+        predictions = [
+            {
+                "month":            row["ds"].strftime("%Y-%m"),
+                "predicted_income": float(row["yhat"]),
+                "predicted_lower":  float(row["yhat_lower"]),
+                "predicted_upper":  float(row["yhat_upper"]),
+                "is_high_risk":     bool(row["is_high_risk"]),
+            }
+            for _, row in predictions_df.iterrows()
+        ]
 
-        return predictions, risk_score, (model, forecast)
+        model_tuple = (model, forecast)
+
+        # Store in cache
+        if ck:
+            # Simple LRU eviction — drop oldest key when over limit
+            if len(self._prophet_cache) >= self._cache_max_size:
+                oldest = next(iter(self._prophet_cache))
+                del self._prophet_cache[oldest]
+            self._prophet_cache[ck] = {
+                "predictions":  predictions,
+                "risk_score":   risk_score,
+                "model_tuple":  model_tuple,
+            }
+
+        return predictions, risk_score, model_tuple
 
     def validate_forecast(self, df_monthly):
         """Step 7: Prophet cross-validation — returns MAE, MAPE, RMSE."""
@@ -177,6 +215,120 @@ class IDCS_Engine:
                 continue
 
         return best_params, sorted(results, key=lambda x: x['mape'])
+
+    def calculate_fraud_score(
+        self,
+        current_credit_count: int,
+        prev_credit_count: int,
+        current_credit_total: float,
+        prev_credit_total: float,
+        current_debit_count: int,
+        prev_debit_count: int,
+        sector_dip: float,
+        squad_avg_dip: float,
+        claims_last_12m: int,
+        prophet_predicted_stable: bool,
+        claimed_dip_pct: float,
+        severe_weather_event: bool = False,
+    ) -> dict:
+        """
+        Composite Fraud Score — 5 independent signals converging into a 0-100 score.
+
+        Signal 1 (+35): Velocity Paradox — amount drops but transaction COUNT holds steady.
+        Signal 2 (+25): Sector/Squad gap — personal dip with no macro corroboration.
+        Signal 3 (+20): Debit/Credit ratio shift — still spending digitally, not receiving.
+        Signal 4 (+15): Recidivism Watch — abnormal claim frequency in last 12 months.
+        Signal 5 (+10): Forecast Mismatch — Prophet predicted stable, user claims dip.
+
+        Returns a dict with score (0–100), triggered signals list, and recommended action.
+        """
+        score = 0
+        signals = []
+
+        # ── Signal 1: Velocity Paradox ─────────────────────────────────────────
+        if prev_credit_total > 0 and prev_credit_count > 0:
+            amount_drop_ratio   = (prev_credit_total - current_credit_total) / prev_credit_total
+            count_drop_ratio    = (prev_credit_count - current_credit_count) / prev_credit_count
+
+            # Red flag: amount craters but transaction count is suspiciously stable
+            if amount_drop_ratio > 0.30 and count_drop_ratio < 0.10:
+                score += 35
+                signals.append(
+                    f"VELOCITY_PARADOX: Amount dropped {amount_drop_ratio:.0%} but "
+                    f"transaction count only fell {count_drop_ratio:.0%} — income likely "
+                    f"redirected off-channel."
+                )
+
+        # ── Signal 2: Sector / Squad Corroboration Gap ─────────────────────────
+        if claimed_dip_pct > 0.30 and not severe_weather_event:
+            if sector_dip < 0.05:
+                score += 15
+                signals.append(
+                    f"SECTOR_GAP: Personal dip {claimed_dip_pct:.0%} with no macro sector dip "
+                    f"({sector_dip:.1%}). No broad economic explanation."
+                )
+            # Squad corroboration adds independent weight
+            if squad_avg_dip < 0.10:
+                score += 10
+                signals.append(
+                    f"SQUAD_GAP: Peers in the same area/sector show avg dip of only "
+                    f"{squad_avg_dip:.1%}. Isolated dip is anomalous."
+                )
+
+        # ── Signal 3: Debit/Credit Ratio Shift ────────────────────────────────
+        if prev_credit_count > 0 and prev_debit_count > 0:
+            curr_ratio = current_debit_count / max(1, current_credit_count)
+            prev_ratio = prev_debit_count / max(1, prev_credit_count)
+
+            if curr_ratio > prev_ratio * 2.5:
+                score += 20
+                signals.append(
+                    f"DEBIT_CREDIT_SHIFT: Debit/credit ratio jumped from "
+                    f"{prev_ratio:.1f}x to {curr_ratio:.1f}x. Still spending digitally "
+                    f"but not receiving — suggests off-channel income."
+                )
+
+        # ── Signal 4: Recidivism Watch ─────────────────────────────────────────
+        if claims_last_12m >= 3:
+            score += 15
+            signals.append(
+                f"RECIDIVISM: {claims_last_12m} approved claims in the past 12 months. "
+                f"Statistically abnormal frequency for genuine income dips."
+            )
+        elif claims_last_12m == 2:
+            score += 5
+            signals.append(f"RECIDIVISM_WATCH: {claims_last_12m} claims in 12 months — monitoring.")
+
+        # ── Signal 5: Prophet Forecast Mismatch ───────────────────────────────
+        if prophet_predicted_stable and claimed_dip_pct > 0.20:
+            score += 10
+            signals.append(
+                "FORECAST_MISMATCH: Prophet 6-month model predicted a stable income month. "
+                "A genuine structural dip was not anticipated by the AI model."
+            )
+
+        score = min(100, score)
+
+        # ── Decision ──────────────────────────────────────────────────────────
+        if score >= 75:
+            action = "HARD_BLOCK"
+            action_label = "Claim rejected. Account flagged UNDER_REVIEW. Trust Squad notified."
+        elif score >= 50:
+            action = "72H_HOLD"
+            action_label = "Claim held for 72-hour manual review before disbursement."
+        elif score >= 30:
+            action = "SOFT_FLAG"
+            action_label = "Claim auto-approved but account added to watch list."
+        else:
+            action = "CLEAN"
+            action_label = "No anomalies detected. Process normally."
+
+        return {
+            "fraud_score":   score,
+            "action":        action,
+            "action_label":  action_label,
+            "signals":       signals,
+        }
 
     def calculate_metrics(self, income_history, src_cap, current_income, w_emp=1.0, transaction_count=15, sector_dip=0.0, squad_no_claim_bonus=False, severe_weather_event=False):
         """

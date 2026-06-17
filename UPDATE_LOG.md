@@ -1,3 +1,211 @@
+# IDCS Update Log - Phase 2.1
+
+---
+
+## Phase 2.1: Deep Optimisation + RAG + Fine-Tuned Copilot — 2026-06-17
+
+### Objectives
+Three-part optimisation sprint:
+1. **Performance** — eliminate hot-path bottlenecks across DB, engine, and scheduler
+2. **RAG** — add semantic knowledge retrieval to ground the AI Copilot in IDCS policy
+3. **Fine-Tuning** — replace generic Copilot prompts with a deeply personalised, metric-rich system prompt
+
+---
+
+### New File: `rag.py` — IDCS Knowledge Base
+
+| Component | Detail |
+|---|---|
+| **Corpus** | 13 curated policy documents covering all major IDCS domains |
+| **Topics** | Fraud signals (×5), Grace period, Velocity/Stability, Micro-premium, Trust Squads, Prophet, Eligibility, Income categories |
+| **Embedding** | Gemini `text-embedding-004` via `genai.embed_content()` — semantic cosine similarity |
+| **Fallback** | Jaccard token overlap — works fully offline with no API key |
+| **API** | `get_knowledge_base()` singleton; `kb.retrieve(query, top_k=3)` → list of relevant chunks |
+| **Lazy init** | Documents embedded once at first `/chat` call, then cached in-memory |
+
+---
+
+### `database.py` — Performance Optimisations
+
+**6 composite indexes added** (applied live to `idcs.db`):
+
+| Index | Columns | Query it eliminates full-scans for |
+|---|---|---|
+| `ix_txn_user_type_ts` | `user_id, transaction_type, timestamp` | All transaction window queries (webhook, claims, evaluate) |
+| `ix_claim_user_status_ts` | `user_id, status, created_at` | Recidivism count, fraud-watch, claims history |
+| `ix_risk_user_ts` | `user_id, snapshot_at` | Latest risk score lookups |
+| `ix_policy_user_status` | `user_id, status` | Policy fetch on every webhook/claim |
+| `ix_policy_status` | `status` | Nightly grace-period job full-policy scan |
+| `ix_alert_policy_status` | `policy_id, status` | Alert resolution in webhook + admin endpoint |
+
+**SQLite WAL Mode enabled** (via `event.listens_for` on first connection):
+- `PRAGMA journal_mode=WAL` — concurrent reads during writes (no read lock)
+- `PRAGMA synchronous=NORMAL` — faster fsync without data integrity risk
+- `PRAGMA cache_size=-64000` — 64 MB page cache
+- `PRAGMA foreign_keys=ON` — enforces referential integrity
+
+---
+
+### `engine.py` — Computation Optimisations
+
+| Optimisation | Detail |
+|---|---|
+| **Prophet model cache** | `_prophet_cache` dict keyed by `(user_id, data_hash, sector_dip)`. Repeated `/evaluate` calls with unchanged history skip Prophet fitting entirely — ~2–5s saved per request |
+| **Data hash** | SHA-256 of monthly DataFrame JSON — cache auto-invalidates when new transactions arrive |
+| **LRU holidays** | `@lru_cache(maxsize=2)` on `_kenyan_holidays()` — holiday DataFrame built once per year, not per forecast |
+| **Vectorized risk** | `numpy` array operations replace Python loops in `predict_risk_horizon` depth-penalty calculation |
+| **Cache eviction** | Simple FIFO eviction at 200 entries — memory-safe in production |
+
+---
+
+### `main.py` — AI Copilot Rewrite
+
+**Old**: Generic prompt with 3 fields (name, velocity, transaction count)
+**New**: 6-section structured prompt with 20+ live metrics
+
+| Section | Content |
+|---|---|
+| **User Profile** | Name, employment type, sector, county, SRC cap |
+| **Live Scores** | Velocity, stability, fraud score + tier label, risk level, dip probability |
+| **Policy Status** | Status (ACTIVE/GRACE/SUSPENDED), premium rate, arrears, days silent |
+| **30-day Snapshot** | Credit transaction count, total KSh received, average per transaction |
+| **Claims History** | Approved / held / rejected counts + contextual warnings |
+| **RAG Context** | Top-3 IDCS policy chunks retrieved by query similarity |
+| **Few-Shot Examples** | 3 in-prompt example Q&As tuned to user's actual numbers |
+
+**RAG Integration in `/chat`:**
+- User message → `kb.retrieve(query, top_k=3)` → top-3 relevant policy chunks
+- Chunks injected into Gemini system prompt as `=== IDCS Policy Reference ===`
+- Response includes `rag_sources` list (which docs were consulted)
+
+**Fine-Tuned Fallback** (no API key):
+Replaces old single-branch fallback with 6 topic-matched branches:
+- `arrears/grace/lapse` → policy lifecycle with exact days and KSh figures
+- `fraud/reject/block` → explains the 5 fraud signals specific to user's score
+- `velocity/score/level` → actionable count-to-next-level advice
+- `claim/payout/dip` → eligibility check against live stability score
+- `squad/trust/peer` → Trust Squad dividend mechanics
+- Default → full metric summary with status alert
+
+**Prophet Cache Key** in `/evaluate`:
+`predict_risk_horizon(..., cache_key=str(user_id))` — same user calling `/evaluate` twice in a row with no new income data hits the cache.
+
+**New `/chat` response fields:**
+- `stability_score`, `fraud_score`, `risk_level`, `policy_status`, `arrears_ksh`, `rag_sources`
+
+---
+
+### Smoke Test Results (2026-06-17)
+```
+✓ Health:   version=2.0.0 status=online
+✓ Endpoints: 19 registered
+✓ RAG retrieve (TF-IDF): ['Prophet Forecast Mismatch', 'Velocity Paradox', 'Micro-Premium Rates']
+✓ DB indexes: 14 total (6 composite + 8 primary keys)
+✓ SQLite WAL: wal
+✓ Engine cache: _prophet_cache={}, _cache_max_size=200
+=== ALL CHECKS PASSED ===
+```
+
+---
+
+# IDCS Update Log - Phase 2.0
+
+---
+
+## Phase 2: Lapse Prevention + Composite Fraud Scoring — 2026-06-17
+
+### Problem (Survey Feedback)
+Two critical gaps identified from user survey:
+1. Users who stop receiving income lose cover precisely when they need it most — the micro-premium model has no graceful handling for income silence.
+2. Users are deliberately requesting cash payments from customers to make M-Pesa look like a dip and trigger fraudulent compensation.
+
+---
+
+### `database.py` — New Models & Columns
+
+| Change | Detail |
+|---|---|
+| `Policy.arrears_balance` | Tracks total outstanding premium debt (KSh) when income goes silent |
+| `Policy.arrears_catch_up_txns` | Number of future transactions over which debt will be spread and recovered |
+| `Policy.grace_period_since` | Timestamp when income silence was first detected |
+| `Policy.status` new values | `GRACE_PERIOD` added alongside existing `ACTIVE`, `SUSPENDED`, `LAPSED` |
+| `Policy.alerts` relationship | Links policy to all its PremiumAlert records |
+| **`PremiumAlert`** (new table) | Full lifecycle record: `days_silent`, `arrears_amount`, `catch_up_txns_remaining`, `reminders_sent`, `status`, timestamps |
+
+---
+
+### `engine.py` — `calculate_fraud_score()` (New Method)
+
+5-signal composite fraud detection returning a score 0–100 and a recommended action:
+
+| Signal | Weight | Logic |
+|---|---|---|
+| **Velocity Paradox** | +35 | Amount drops >30% but transaction *count* falls <10% — income redirected off-channel |
+| **Sector/Squad Gap** | +25 | Personal dip >30% with no sector (>15pt) or squad (>10pt) corroboration |
+| **Debit/Credit Shift** | +20 | Debit/credit ratio jumps >2.5× vs prior period — still spending digitally, not receiving |
+| **Recidivism Watch** | +15 | ≥3 approved claims in last 12 months (statistically abnormal) |
+| **Forecast Mismatch** | +10 | Prophet predicted stable month, user is claiming a dip |
+
+Decision tree:
+- **0–29** → `CLEAN` — process normally
+- **30–49** → `SOFT_FLAG` — approve at 60% co-insurance (tightened from 70%)
+- **50–74** → `72H_HOLD` → `FLAGGED_FOR_AUDIT` — human review before disbursement
+- **75+** → `HARD_BLOCK` → `REJECTED` — claim denied, account flagged
+
+---
+
+### `main.py` — Backend Changes
+
+#### Grace-Period Scheduler (new)
+- `grace_period_job()` — nightly background job (APScheduler, 24h interval)
+  - Scans all `ACTIVE` and `GRACE_PERIOD` policies
+  - Detects income silence by checking last credit transaction timestamp
+  - Escalates: `ACTIVE → GRACE_PERIOD` (day 7) → `SUSPENDED` (day 37) → `LAPSED` (day 90)
+  - Accumulates `daily_arrears` proportionally to user's rolling avg income — not a flat fee
+  - Creates/updates `PremiumAlert` records throughout
+- `_send_sms()` — Africa's Talking SMS dispatcher with dev fallback to log
+- Tiered reminder messages at Day 7, 14, 30, then weekly after that
+- `lifespan()` context manager starts/stops scheduler cleanly on app boot/shutdown
+
+#### `/webhook/daraja` — Self-Healing Arrears Recovery
+- On first credit after `GRACE_PERIOD` / `SUSPENDED`: policy reinstates to `ACTIVE` automatically
+- Arrears catch-up spread computed: `min(60, days_silent × 2)` future transactions
+- Each subsequent credit deducts `normal_premium + arrears_share` until debt is cleared
+- Response now includes `arrears_catch_up`, `arrears_remaining`, `policy_status`
+
+#### `/claims/file` — Composite Fraud Scorer (rewritten)
+- Pulls current (last 30 days) and prior (30–60 days ago) transaction windows for delta comparison
+- Runs `engine.calculate_fraud_score()` with all 5 signals
+- Co-insurance tightened to 60% for `SOFT_FLAG` accounts (was 70%)
+- `HARD_BLOCK` → claim `REJECTED`, payout = 0
+- `72H_HOLD` → claim `FLAGGED_FOR_AUDIT`
+- Fraud score persisted into a new `RiskScore` snapshot
+- Response now includes `fraud_score`, `fraud_action`, `fraud_signals`, `co_insurance`
+- `GRACE_PERIOD` policies can still file claims (suspended/lapsed cannot)
+
+#### New Admin Endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /admin/premium-alerts` | View all PremiumAlert records with optional `?status_filter=ACTIVE` |
+| `POST /admin/trigger-grace-check` | Manually run the nightly grace-period job (for testing) |
+| `GET /admin/fraud-watch` | Triage view of all flagged, rejected, and soft-flagged claims |
+
+#### New Dependency
+- `apscheduler` — added to `env/` via pip
+
+---
+
+### Council Policy Decisions Embedded
+
+1. **No lapse without warning** — 3-stage reminder system (7d / 14d / 30d) before any suspension
+2. **Self-healing recovery** — arrears cleared automatically when income resumes; no human needed
+3. **Co-insurance disincentive tightening** — SOFT_FLAG → 60% (from 70%) makes cash diversion unprofitable
+4. **Proportional arrears** — daily debt = daily_avg_income × premium_rate; fair across income levels
+5. **Grace ≠ Lapse** — a SUSPENDED policy reinstates on next credit; a LAPSED policy requires re-underwriting
+
+---
+
 # IDCS Update Log - Phase 1.5
 
 ---
@@ -56,10 +264,10 @@ Also: `sector_dip` now correctly passed from `req.sector_dip` into `predict_risk
 **`frontend/src/App.jsx`**
 - Added `forecast` state (`useState([])`)
 - `handleSync` now captures `d.forecast` from the evaluate response
-- Added **"🔮 6-Month Income Forecast"** card in the dashboard (above AI Copilot):
+- Added **" 6-Month Income Forecast"** card in the dashboard (above AI Copilot):
   - 3-column grid of month tiles
-  - High-risk months: red border + red text + `⚠ High Risk — Dip Likely` label
-  - Safe months: subtle green + `✓ Stable` label
+  - High-risk months: red border + red text + ` High Risk — Dip Likely` label
+  - Safe months: subtle green + ` Stable` label
   - Each tile shows predicted income + confidence floor (yhat_lower)
   - Prophet Risk Score bar at the bottom: green / amber / red + contextual message
 

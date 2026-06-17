@@ -2,10 +2,11 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   User, ShieldAlert, BarChart3, RefreshCw,
   Settings, LogOut, CheckCircle2, TrendingDown, Info, DollarSign,
-  AlertTriangle, X, Users, Shield, UserCog, MessageSquare, Send
+  AlertTriangle, X, Users, Shield, UserCog, MessageSquare, Send, Upload,
+  Zap, Calendar, ShieldCheck, TrendingUp
 } from 'lucide-react';
 import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
+  AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
 } from 'recharts';
 
 const API = '/api';
@@ -94,7 +95,7 @@ function SettingsPanel({ settingsTab, setSettingsTab, settingsData, setSettingsD
           {settingsTab === 'squad' && (
             <div style={{ display:'flex', flexDirection:'column', gap:20 }}>
               <div style={{ background:'#121216', border:'1px solid #00d296', borderRadius:10, padding:16 }}>
-                <div style={{ color:'#00d296', fontWeight:700, fontSize:13, marginBottom:6 }}>🛡️ What is a Trust Squad?</div>
+                <div style={{ color:'#00d296', fontWeight:700, fontSize:13, marginBottom:6 }}> What is a Trust Squad?</div>
                 <div style={{ color:'#9e9ea7', fontSize:12, lineHeight:1.6 }}>
                   Pool with 2–5 peers. If your entire squad files zero suspicious claims for 12 months, everyone earns a
                   <b style={{ color:'#fff' }}> No-Claim Dividend</b> — a permanent
@@ -102,11 +103,11 @@ function SettingsPanel({ settingsTab, setSettingsTab, settingsData, setSettingsD
                 </div>
               </div>
               <button className="btn btn-secondary"
-                onClick={() => setSquadMsg('✅ Join request registered! Activation coming in Phase 2.')}>
+                onClick={() => setSquadMsg(' Join request registered! Activation coming in Phase 2.')}>
                 Request to Join a Squad
               </button>
               <button className="btn btn-primary"
-                onClick={() => setSquadMsg('✅ New squad created! Share your code with peers. Activation in Phase 2.')}>
+                onClick={() => setSquadMsg(' New squad created! Share your code with peers. Activation in Phase 2.')}>
                 <Users size={16} /> Create a New Squad
               </button>
               {squadMsg && <div style={{ background:'#1c2e24', border:'1px solid #00d296', borderRadius:8, padding:12, fontSize:12, color:'#00d296' }}>{squadMsg}</div>}
@@ -116,7 +117,7 @@ function SettingsPanel({ settingsTab, setSettingsTab, settingsData, setSettingsD
 
         {settingsTab !== 'squad' && (
           <div style={{ padding:'16px 24px', borderTop:'1px solid #2b2b36' }}>
-            {settingsSaved && <div style={{ fontSize:12, marginBottom:10, color: settingsSaved.startsWith('✅') ? '#00d296' : '#ff4444' }}>{settingsSaved}</div>}
+            {settingsSaved && <div style={{ fontSize:12, marginBottom:10, color: settingsSaved.startsWith('') ? '#00d296' : '#ff4444' }}>{settingsSaved}</div>}
             <button className="btn btn-primary" onClick={saveSettings} style={{ width:'100%' }}>Save Changes</button>
           </div>
         )}
@@ -206,6 +207,47 @@ function App() {
     });
   };
 
+  const handleFileUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    
+    setClaimMsg('');
+    const formData = new FormData();
+    formData.append('file', file);
+    
+    setIsSyncing(true);
+    try {
+      const res = await fetch(`${API}/upload/statement`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: formData
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setClaimMsg(data.detail || 'Upload failed');
+      } else {
+        setClaimMsg('Upload successful! Statement processed.');
+        if (data.inflows && data.inflows.length > 0) {
+            const mappedHistory = data.inflows.map(inf => {
+                const d = new Date(inf.date);
+                const month = d.toLocaleString('default', { month: 'short' });
+                return { month, amount: inf.amount, status: 'Paid', category: 'Revenue' };
+            });
+            // We take the last 12 months or similar
+            const recentHistory = mappedHistory.slice(-12);
+            setIncomeHistory(recentHistory);
+            if (recentHistory.length > 0) {
+              setProfile(p => ({...p, current_income: recentHistory[recentHistory.length - 1].amount }));
+            }
+        }
+      }
+    } catch (err) {
+      setClaimMsg('Network error during upload.');
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
   // ── Settings handlers ──────────────────────────────────────
   const openSettings = async () => {
     try {
@@ -236,12 +278,12 @@ function App() {
         body: JSON.stringify(settingsData)
       });
       if (res.ok) {
-        setSettingsSaved('✅ Settings saved successfully.');
+        setSettingsSaved(' Settings saved successfully.');
         setTimeout(() => setSettingsSaved(''), 3000);
       } else {
-        setSettingsSaved('❌ Failed to save. Please try again.');
+        setSettingsSaved(' Failed to save. Please try again.');
       }
-    } catch { setSettingsSaved('❌ Network error.'); }
+    } catch { setSettingsSaved(' Network error.'); }
   };
 
   const handleSync = async () => {
@@ -417,15 +459,22 @@ function App() {
 
         <div className="nav-section">
           <div className="nav-label">Live Actions</div>
+          
+          <label className="btn btn-secondary" style={{ display: 'block', textAlign: 'center', cursor: 'pointer', marginBottom: 10 }}>
+            <Upload size={18} style={{ verticalAlign: 'middle', marginRight: 6 }} />
+            Upload PDF Statement
+            <input type="file" accept=".pdf" style={{ display: 'none' }} onChange={handleFileUpload} />
+          </label>
+
           <button className="btn btn-primary" onClick={handleSync} disabled={isSyncing}>
             {isSyncing ? <RefreshCw size={18} style={{ animation: 'spin 1s linear infinite' }} /> : <RefreshCw size={18} />}
             {isSyncing ? 'Syncing...' : 'Sync & Evaluate'}
           </button>
 
           {evaluation?.eligible && (
-            <button className="btn btn-primary" onClick={fileClaim}
+            <button className="btn btn-primary hover-elevation" onClick={fileClaim}
               style={{ marginTop: 10, backgroundColor: '#ff9800', border: 'none' }}>
-              📋 File a Claim
+              <ShieldCheck size={18} /> File a Claim
             </button>
           )}
 
@@ -450,12 +499,12 @@ function App() {
           <div className="topbar-actions">
             {evaluation?.auto_disburse && (
               <div className="badge badge-success" style={{ backgroundColor: '#00d296', color: '#121212', fontWeight: 'bold' }}>
-                ⚡ Auto-Disbursement Triggered
+                <Zap size={14} style={{ marginRight: 4 }} /> Auto-Disbursement Triggered
               </div>
             )}
             {evaluation?.financial_level && (
               <div className="badge badge-secondary" style={{ border: '1px solid #ffaa00', color: '#ffaa00' }}>
-                🏆 Level {evaluation.financial_level} Resilience
+                 Level {evaluation.financial_level} Resilience
               </div>
             )}
             {evaluation?.needs_manual_audit && (
@@ -524,14 +573,20 @@ function App() {
               <h3 style={{ marginBottom: 20 }}>Income History & Variance</h3>
               <div className="chart-container">
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={incomeHistory}>
+                  <AreaChart data={incomeHistory}>
+                    <defs>
+                      <linearGradient id="colorAmount" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#00d296" stopOpacity={0.3}/>
+                        <stop offset="95%" stopColor="#00d296" stopOpacity={0}/>
+                      </linearGradient>
+                    </defs>
                     <CartesianGrid strokeDasharray="3 3" stroke="#2b2b36" />
                     <XAxis dataKey="month" stroke="#9e9ea7" tick={{fill:'#9e9ea7'}} />
                     <YAxis stroke="#9e9ea7" tick={{fill:'#9e9ea7'}} />
                     <Tooltip contentStyle={{ backgroundColor:'#1c1c24', border:'1px solid #2b2b36', borderRadius:'8px' }} itemStyle={{ color:'#f1f1f1' }} />
-                    <Line type="monotone" dataKey="amount" stroke="#00d296" strokeWidth={3}
-                      dot={{r:4, fill:'#121216', stroke:'#00d296', strokeWidth:2}} activeDot={{r:6}} />
-                  </LineChart>
+                    <Area type="monotone" dataKey="amount" stroke="#00d296" fillOpacity={1} fill="url(#colorAmount)" strokeWidth={3}
+                      activeDot={{r:6, fill:'#00d296', stroke:'#121216', strokeWidth:2}} />
+                  </AreaChart>
                 </ResponsiveContainer>
               </div>
             </div>
@@ -586,7 +641,7 @@ function App() {
           {forecast.length > 0 && (
             <div className="card" style={{ marginBottom: 24 }}>
               <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:6 }}>
-                <span style={{ fontSize:20 }}>🔮</span>
+                <TrendingUp size={24} color="#00d296" />
                 <h3 style={{ margin:0 }}>6-Month Income Forecast</h3>
                 <span className="badge badge-secondary" style={{ marginLeft:'auto', fontSize:11 }}>Prophet AI</span>
               </div>
@@ -595,7 +650,8 @@ function App() {
               </p>
               <div style={{ display:'grid', gridTemplateColumns:'repeat(3, 1fr)', gap:12 }}>
                 {forecast.map((f, i) => (
-                  <div key={i} style={{
+                  <div key={i} className="fade-in" style={{
+                    animationDelay: `${i * 0.1}s`,
                     background: f.is_high_risk ? 'rgba(255,75,75,0.08)' : 'rgba(0,210,150,0.04)',
                     border: `1px solid ${f.is_high_risk ? 'rgba(255,75,75,0.35)' : '#2b2b36'}`,
                     borderRadius: 10, padding: '14px 16px'
@@ -609,8 +665,8 @@ function App() {
                       Floor: KES {f.predicted_lower.toLocaleString(undefined, {maximumFractionDigits:0})}
                     </div>
                     {f.is_high_risk
-                      ? <div style={{ marginTop:8, fontSize:11, color:'#ff4b4b', fontWeight:700 }}>⚠ High Risk — Dip Likely</div>
-                      : <div style={{ marginTop:8, fontSize:11, color:'#00d296', fontWeight:600 }}>✓ Stable</div>
+                      ? <div style={{ marginTop:8, fontSize:11, color:'#ff4b4b', fontWeight:700, display:'flex', alignItems:'center', gap:4 }}><AlertTriangle size={14} /> High Risk — Dip Likely</div>
+                      : <div style={{ marginTop:8, fontSize:11, color:'#00d296', fontWeight:600, display:'flex', alignItems:'center', gap:4 }}><CheckCircle2 size={14} /> Stable</div>
                     }
                   </div>
                 ))}
@@ -656,7 +712,7 @@ function App() {
               ))}
               {chatLoading && (
                 <div style={{ display:'flex', justifyContent:'flex-start' }}>
-                  <div style={{ padding:'10px 14px', background:'#1c1c24', borderRadius:12,
+                  <div className="pulse" style={{ padding:'10px 14px', background:'#1c1c24', borderRadius:12,
                     border:'1px solid #2b2b36', color:'#9e9ea7', fontSize:13,
                     display:'flex', alignItems:'center', gap:8 }}>
                     <RefreshCw size={12} style={{ animation:'spin 1s linear infinite' }} />
@@ -685,8 +741,8 @@ function App() {
           {/* Plans */}
           <h2 style={{ marginBottom: 24 }}>Choose Your Income Safety Plan</h2>
           <div className="pricing-grid">
-            <div className={`pricing-card ${selectedPlan === 'monthly' ? 'selected' : ''}`} onClick={() => setSelectedPlan('monthly')}>
-              <div className="pricing-title">📈 Embedded Micro-Premium</div>
+            <div className={`pricing-card hover-elevation ${selectedPlan === 'monthly' ? 'selected' : ''}`} onClick={() => setSelectedPlan('monthly')}>
+              <div className="pricing-title" style={{ display:'flex', alignItems:'center', justifyContent:'center', gap:8 }}><TrendingUp size={20} color="#00d296" /> Embedded Micro-Premium</div>
               <div className="pricing-price">
                 {((evaluation?.micro_deduction_rate ?? 0.015) * 100).toFixed(1)}%
                 <span className="pricing-period"> per transaction</span>
@@ -700,8 +756,8 @@ function App() {
               </button>
             </div>
 
-            <div className={`pricing-card ${selectedPlan === 'upfront' ? 'selected' : ''}`} onClick={() => setSelectedPlan('upfront')}>
-              <div className="pricing-title">🛡️ 6-Month Shield</div>
+            <div className={`pricing-card hover-elevation ${selectedPlan === 'upfront' ? 'selected' : ''}`} onClick={() => setSelectedPlan('upfront')}>
+              <div className="pricing-title" style={{ display:'flex', alignItems:'center', justifyContent:'center', gap:8 }}><Shield size={20} color="#f5a623" /> 6-Month Shield</div>
               <div className="pricing-price">
                 KES {upfrontPremium.toLocaleString(undefined, {maximumFractionDigits:0})}
                 <span className="pricing-period"> Total</span>

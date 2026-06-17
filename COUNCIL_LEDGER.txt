@@ -64,3 +64,33 @@ For rural workers and market vendors, the backend now ingests `severe_weather_ev
 
 Step 11: The IDCS AI Copilot
 We activated an LLM-powered financial advisory module. By analyzing the precise timestamps and volumes of incoming transactions, the Copilot provides hyper-personalized business advice directly in the dashboard (e.g., advising a rider to work on high-velocity Thursday nights), actively helping the user stabilize their income before a dip ever occurs.
+
+Step 12: Graceful Lapse Prevention — The Grace Period & Arrears Recovery System
+The council addressed a critical vulnerability identified through user survey: a user whose income stream goes silent loses cover precisely at the moment they need it most, since IDCS micro-premiums are embedded in income receipts. Zero income = zero collection.
+
+The council's solution is a three-tier grace system rather than a binary active/lapsed state. A nightly background job (APScheduler) monitors every active policy for income silence. After 7 days of no detected credit transactions, the policy transitions to GRACE_PERIOD and a PremiumAlert is created. The system begins accumulating daily_arrears proportional to the user's rolling average daily income — not a flat fee, meaning a high-income user owes more per missed day than a low-income user, which is actuarially correct.
+
+A tiered SMS reminder system fires at Day 7 (soft check-in), Day 14 (state the debt, explain the catch-up plan), and Day 30 (urgent final warning). After Day 37 the policy moves to SUSPENDED. After Day 90 with no response it LAPSES, requiring full re-underwriting.
+
+The critical innovation is self-healing reinstatement. When the first M-Pesa credit transaction arrives after a silence period, the Daraja webhook automatically reinstates the policy to ACTIVE, calculates a catch-up schedule spread across min(60, gap_days × 2) future transactions, and begins recovering the arrears debt alongside each regular micro-premium deduction. No human intervention is required. The honest worker who broke their leg and had zero income for three weeks does not lose their cover — they are precisely the person IDCS exists to protect.
+
+A SUSPENDED policy can reinstate; a LAPSED policy cannot. This distinction is a deliberate policy boundary.
+
+Step 13: Composite Fraud Detection — The Cash Diversion Defence
+The council addressed the most sophisticated fraud vector in the system: users who continue working at normal income levels but deliberately instruct customers to pay in untraceable cash rather than M-Pesa, causing the system to observe an apparent income dip and disburse compensation.
+
+No single detection mechanism is sufficient against this attack. The council implemented a five-signal converging evidence model:
+
+Signal 1 — The Velocity Paradox (+35 pts): If income genuinely dips, both the transaction amount AND the transaction count fall together. A person who normally receives 40 M-Pesa transfers of KSh 1,000 does not suddenly receive 38 transfers of KSh 200 unless they are redirecting large payments to cash. If the amount drops more than 30% while the count falls less than 10%, the system scores this as a strong cash-diversion signal.
+
+Signal 2 — Sector and Squad Corroboration Gap (+25 pts): A real economic shock affects entire sectors and geographic clusters, not isolated individuals. If a user claims a 40% personal dip while their sector shows a 2% dip and their Trust Squad peers show a 5% dip, the isolation of the loss is a strong indicator of artificial manipulation rather than genuine misfortune.
+
+Signal 3 — Debit/Credit Ratio Shift (+20 pts): A person who has redirected income to cash continues to spend digitally (airtime, rent, shopping). If their debit transaction count holds steady or rises while their credit count collapses, the asymmetry reveals that digital economic activity is ongoing — income is simply being received off-channel.
+
+Signal 4 — Recidivism Watch (+15 pts): Three or more approved income-dip claims within a rolling 12-month window is statistically abnormal for genuine structural income volatility. The council treats this frequency as an independent fraud risk factor.
+
+Signal 5 — Prophet Forecast Mismatch (+10 pts): If the AI forecasting model predicted a stable income month and the user is now claiming a dip, the disagreement between the model and the claim is an additional corroborating signal.
+
+The composite score (0–100) drives a four-tier decision: CLEAN (process normally), SOFT_FLAG (approve at 60% co-insurance instead of 70%), 72H_HOLD (hold for 72-hour human review), or HARD_BLOCK (reject outright, flag account). The 60% co-insurance rate for SOFT_FLAG is a deliberate policy tightening: it makes low-effort casual fraud economically unattractive by increasing the break-even threshold. The 72-hour hold is the most powerful deterrent for mid-tier suspicious claims — most fraudsters will not fabricate a complete paper trail when they know a human compliance officer will call them within three days.
+
+Signed into the permanent record by the IDCS System Architecture Council - June 2026

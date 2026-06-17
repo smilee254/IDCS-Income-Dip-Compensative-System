@@ -3,10 +3,10 @@ import pdfplumber # pyre-ignore[21]
 import io
 import json
 import os
-import streamlit as st # pyre-ignore[21]
+import google.generativeai as genai # pyre-ignore[21]
+from datetime import datetime
 from typing import List, Optional, Dict
 from pydantic import BaseModel, Field, validator # pyre-ignore[21]
-import google.generativeai as genai # pyre-ignore[21]
 from datetime import datetime
 
 # --- 1. Pydantic Models for Validation ---
@@ -41,7 +41,7 @@ class IncomeVisionExtractor:
     def __init__(self):
         # Configure using st.secrets as requested
         try:
-            api_key = st.secrets["GEMINI_API_KEY"]
+            api_key = os.getenv("GEMINI_API_KEY")
             genai.configure(api_key=api_key)
             
             # Mission: Strictly extract IncomeData schema using structured output
@@ -72,12 +72,13 @@ class IncomeVisionExtractor:
         except Exception:
             self.model = None
 
-    def extract_inflows(self, file_content: bytes, is_mpesa: bool = True) -> List[Dict]:
+    def extract_inflows(self, file_content: bytes, is_mpesa: bool = True, user_name: Optional[str] = None) -> List[Dict]:
         """
         Processes PDF and extracts ONLY inflows using Gemini 2.5 Flash.
+        If user_name is provided, it verifies the name exists in the document text.
         """
         if not self.model:
-            raise ValueError("Gemini API Key missing in st.secrets['GEMINI_API_KEY']")
+            raise ValueError("Gemini API Key missing in environment variables")
 
         # Extract text for context
         full_texts: List[str] = []
@@ -88,6 +89,9 @@ class IncomeVisionExtractor:
                     full_texts.append(str(text))
         
         full_text = "\n--PAGE--\n".join(full_texts)
+        
+        if user_name and user_name.lower() not in full_text.lower():
+            raise ValueError(f"Name Verification Failed: The uploaded document does not contain the registered user name '{user_name}'.")
 
         prompt = f"""
         Analyze this bank/M-Pesa statement. Identify and extract ONLY 'Money In' (Credit/Deposits). 
@@ -112,7 +116,7 @@ class IncomeVisionExtractor:
             validated = AIInflowResult(**data)
             return [item.dict() for item in validated.inflows]
         except Exception as e:
-            st.error(f"AI Vision Error: {e}")
+            print(f"AI Vision Error: {e}")
             return []
 
     def summarize_data(self, raw_data: List[Dict]) -> str:
@@ -143,13 +147,11 @@ class IncomeVisionExtractor:
         except Exception as e:
             return f"Error generating summary: {e}"
 
-@st.cache_resource
 def get_extractor():
     return IncomeVisionExtractor()
 
 # --- 3. Data Anchoring & Monthly Aggregation ---
 
-@st.cache_data
 def process_and_group_inflows(mpesa_content: Optional[bytes] = None, bank_content: Optional[bytes] = None):
     """
     Main entry point for Dashboard.

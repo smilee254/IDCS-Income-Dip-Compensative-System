@@ -2,7 +2,7 @@ import os
 from datetime import datetime
 from sqlalchemy import (
     create_engine, Column, Integer, String, Float,
-    Boolean, ForeignKey, DateTime, Text
+    Boolean, ForeignKey, DateTime, Text, Enum, Index, event
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
@@ -76,13 +76,17 @@ class Policy(Base):
     user_id        = Column(Integer, ForeignKey("users.id"), nullable=False)
     premium_rate   = Column(Float, nullable=False)      # e.g. 0.015 = 1.5%
     coverage_limit = Column(Float, nullable=False)      # max payout ceiling (KSh)
-    status         = Column(String, default="ACTIVE")   # "ACTIVE" | "SUSPENDED" | "LAPSED"
+    status         = Column(String, default="ACTIVE")   # "ACTIVE" | "GRACE_PERIOD" | "SUSPENDED" | "LAPSED"
     start_date     = Column(DateTime, default=datetime.utcnow)
     end_date       = Column(DateTime, nullable=True)
     total_premiums_collected = Column(Float, default=0.0)
+    arrears_balance          = Column(Float, default=0.0)   # Outstanding premium debt (KSh)
+    arrears_catch_up_txns    = Column(Integer, default=0)   # Remaining catch-up transactions
+    grace_period_since       = Column(DateTime, nullable=True)  # When silence was first detected
 
     user   = relationship("User",  back_populates="policies")
     claims = relationship("Claim", back_populates="policy", cascade="all, delete-orphan")
+    alerts = relationship("PremiumAlert", back_populates="policy", cascade="all, delete-orphan")
 
 
 # ─── Claims ───────────────────────────────────────────────────────────────────
@@ -124,13 +128,88 @@ class RiskScore(Base):
     user = relationship("User", back_populates="risk_scores")
 
 
+# ─── Premium Alerts (Grace Period & Arrears Tracking) ─────────────────────────
+
+class PremiumAlert(Base):
+    __tablename__ = "premium_alerts"
+    id                       = Column(Integer, primary_key=True, index=True)
+    user_id                  = Column(Integer, ForeignKey("users.id"), nullable=False)
+    policy_id                = Column(Integer, ForeignKey("policies.id"), nullable=False)
+    reason                   = Column(String, default="Income Gap Detected")
+    days_silent              = Column(Integer, default=0)         # Calendar days with no credit txn
+    arrears_amount           = Column(Float, default=0.0)         # Total KSh owed at detection
+    catch_up_txns_remaining  = Column(Integer, default=0)         # Transactions left to spread debt
+    reminders_sent           = Column(Integer, default=0)         # Count of SMS reminders dispatched
+    status                   = Column(String, default="ACTIVE")   # "ACTIVE" | "RESOLVED" | "ESCALATED"
+    first_detected           = Column(DateTime, default=datetime.utcnow)
+    last_reminder            = Column(DateTime, nullable=True)
+    resolved_at              = Column(DateTime, nullable=True)
+
+    user   = relationship("User")
+    policy = relationship("Policy", back_populates="alerts")
+
+
+# ─── Composite Indexes (hot-path query optimisation) ────────────────────────────
+#
+# Transaction queries: user_id + type filter + timestamp ORDER BY
+Index("ix_txn_user_type_ts",
+      Transaction.__table__.c.user_id,
+      Transaction.__table__.c.transaction_type,
+      Transaction.__table__.c.timestamp)
+
+# Claim queries: user_id + status filter + created_at ORDER BY
+Index("ix_claim_user_status_ts",
+      Claim.__table__.c.user_id,
+      Claim.__table__.c.status,
+      Claim.__table__.c.created_at)
+
+# Risk score queries: user_id + snapshot_at DESC
+Index("ix_risk_user_ts",
+      RiskScore.__table__.c.user_id,
+      RiskScore.__table__.c.snapshot_at)
+
+# Policy queries: user_id + status filter
+Index("ix_policy_user_status",
+      Policy.__table__.c.user_id,
+      Policy.__table__.c.status)
+
+# Premium alert queries: policy_id + status filter
+Index("ix_alert_policy_status",
+      PremiumAlert.__table__.c.policy_id,
+      PremiumAlert.__table__.c.status)
+
+# Grace-period job: policies by status only (full-table scan of ACTIVE/GRACE_PERIOD)
+Index("ix_policy_status", Policy.__table__.c.status)
+
+
 # ─── DB Initialisation ────────────────────────────────────────────────────────
 
 DB_URL = os.getenv("DATABASE_URL", "sqlite:///./idcs.db")
-engine = create_engine(
-    DB_URL,
-    connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {}
-)
+
+engine_kwargs: dict = {}
+if DB_URL.startswith("sqlite"):
+    engine_kwargs["connect_args"] = {"check_same_thread": False}
+else:
+    # Production PostgreSQL — tuned connection pool
+    engine_kwargs["pool_size"]    = 20
+    engine_kwargs["max_overflow"] = 10
+    engine_kwargs["pool_timeout"] = 30
+    engine_kwargs["pool_recycle"] = 1800
+
+engine = create_engine(DB_URL, **engine_kwargs)
+
+# Enable WAL mode for SQLite — allows concurrent reads during writes
+# (no-op for PostgreSQL; only applied when the first connection is made)
+if DB_URL.startswith("sqlite"):
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_conn, _):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA cache_size=-64000")  # 64 MB page cache
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
@@ -140,4 +219,4 @@ def init_db():
 
 if __name__ == "__main__":
     init_db()
-    print("✅  Database initialised with full IDCS schema.")
+    print("  Database initialised with full IDCS schema.")
