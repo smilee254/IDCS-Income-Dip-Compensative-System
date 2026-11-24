@@ -64,11 +64,12 @@ class IDCS_Engine:
             ])
         return pd.DataFrame(rows)
 
-    def predict_risk_horizon(self, df_monthly, mu, sector_dip=0.0, cache_key: str = ""):
+    def predict_risk_horizon(self, df_monthly, mu, sector_dip=0.0, cache_key: str = "", db = None):
         """
         Prophet 6-month forecast — tuned for Kenyan gig economy.
         cache_key: if provided, result is cached per (cache_key, data_hash)
           to avoid re-fitting Prophet on identical data.
+        db: optional SQLAlchemy Session to check/store persistent ForecastCache.
         """
         if df_monthly.empty or mu <= 0:
             return [], 0, None
@@ -81,6 +82,21 @@ class IDCS_Engine:
             if ck in self._prophet_cache:
                 cached = self._prophet_cache[ck]
                 return cached["predictions"], cached["risk_score"], cached["model_tuple"]
+            if db:
+                try:
+                    from database import ForecastCache
+                    db_cached = db.query(ForecastCache).filter(ForecastCache.cache_key == ck).first()
+                    if db_cached:
+                        import json
+                        preds = json.loads(db_cached.predictions_json)
+                        self._prophet_cache[ck] = {
+                            "predictions": preds,
+                            "risk_score": db_cached.risk_score,
+                            "model_tuple": None
+                        }
+                        return preds, db_cached.risk_score, None
+                except Exception:
+                    pass
 
         n = len(df_monthly)
         df_prophet = df_monthly.copy()
@@ -149,6 +165,27 @@ class IDCS_Engine:
                 "risk_score":   risk_score,
                 "model_tuple":  model_tuple,
             }
+            if db:
+                try:
+                    from database import ForecastCache
+                    import json
+                    uid_str = cache_key.split(":")[0] if cache_key else ""
+                    uid = int(uid_str) if uid_str.isdigit() else 0
+                    db_entry = db.query(ForecastCache).filter(ForecastCache.cache_key == ck).first()
+                    if not db_entry:
+                        db_entry = ForecastCache(
+                            cache_key        = ck,
+                            user_id          = uid,
+                            risk_score       = float(risk_score),
+                            predictions_json = json.dumps(predictions)
+                        )
+                        db.add(db_entry)
+                    else:
+                        db_entry.risk_score = float(risk_score)
+                        db_entry.predictions_json = json.dumps(predictions)
+                    db.commit()
+                except Exception:
+                    pass
 
         return predictions, risk_score, model_tuple
 
@@ -250,14 +287,29 @@ class IDCS_Engine:
             amount_drop_ratio   = (prev_credit_total - current_credit_total) / prev_credit_total
             count_drop_ratio    = (prev_credit_count - current_credit_count) / prev_credit_count
 
-            # Red flag: amount craters but transaction count is suspiciously stable
-            if amount_drop_ratio > 0.30 and count_drop_ratio < 0.10:
-                score += 35
-                signals.append(
-                    f"VELOCITY_PARADOX: Amount dropped {amount_drop_ratio:.0%} but "
-                    f"transaction count only fell {count_drop_ratio:.0%} — income likely "
-                    f"redirected off-channel."
-                )
+            # Velocity Paradox: amount craters while transaction count is suspiciously stable
+            if amount_drop_ratio > 0.35 and count_drop_ratio < 0.10:
+                # Corroborate with debit spending: if they are still spending actively, high confidence diversion
+                has_active_debit_spending = (current_debit_count >= prev_debit_count * 1.3)
+                if has_active_debit_spending:
+                    score += 35
+                    signals.append(
+                        f"VELOCITY_PARADOX: Amount dropped {amount_drop_ratio:.0%} while "
+                        f"transaction count held steady and debit spending rose — strong cash diversion signal."
+                    )
+                elif amount_drop_ratio > 0.50:
+                    score += 25
+                    signals.append(
+                        f"VELOCITY_ASYMMETRY: Amount dropped {amount_drop_ratio:.0%} while "
+                        f"transaction count remained static ({count_drop_ratio:.0%} change) — flagged for review."
+                    )
+                else:
+                    # Moderate drop with static volume may be seasonal discounting or promotions
+                    score += 10
+                    signals.append(
+                        f"PRICE_COMPRESSION_WATCH: Revenue dropped {amount_drop_ratio:.0%} with "
+                        f"stable customer volume ({count_drop_ratio:.0%} change) — potential discounting."
+                    )
 
         # ── Signal 2: Sector / Squad Corroboration Gap ─────────────────────────
         if claimed_dip_pct > 0.30 and not severe_weather_event:
@@ -330,18 +382,80 @@ class IDCS_Engine:
             "signals":       signals,
         }
 
-    def calculate_metrics(self, income_history, src_cap, current_income, w_emp=1.0, transaction_count=15, sector_dip=0.0, squad_no_claim_bonus=False, severe_weather_event=False):
+    def check_activity_signal(
+        self,
+        debit_count_last_7d: int,
+        debit_total_last_7d: float,
+        mu: float,
+    ) -> dict:
+        """
+        Moral hazard dual-trigger: confirms the business was economically active
+        in the 7 days before a claim.
+
+        A business that is genuinely struggling will still show *some* spending —
+        supplier payments, utility top-ups, transport costs, airtime.
+        Dead silence (no debits at all, nothing bought) is the strongest signal
+        that the owner simply stopped working without an external shock.
+
+        Returns:
+            {"active": bool, "reason": str, "gate": "PASS" | "FAIL"}
+        """
+        min_debit_count = 2            # ≥ 2 debit transactions in 7 days
+        min_debit_ratio = 0.05         # ≥ 5% of monthly µ in outflows (proves economic footprint)
+        min_debit_amount = mu * min_debit_ratio
+
+        if debit_count_last_7d >= min_debit_count and debit_total_last_7d >= min_debit_amount:
+            return {
+                "active": True,
+                "gate": "PASS",
+                "reason": (
+                    f"{debit_count_last_7d} debit transactions "
+                    f"(KSh {debit_total_last_7d:,.0f}) in the last 7 days — business activity confirmed."
+                ),
+            }
+
+        # Soft-fail: some debits but below threshold
+        if debit_count_last_7d >= 1:
+            return {
+                "active": False,
+                "gate": "FAIL",
+                "reason": (
+                    f"Only {debit_count_last_7d} debit transaction(s) totalling "
+                    f"KSh {debit_total_last_7d:,.0f} in the last 7 days. "
+                    f"Minimum required: {min_debit_count} transactions or KSh {min_debit_amount:,.0f}. "
+                    f"A Trust Squad member can attest on your behalf."
+                ),
+            }
+
+        # Hard-fail: no debits at all — strongest idle signal
+        return {
+            "active": False,
+            "gate": "FAIL",
+            "reason": (
+                "No debit activity detected in the 7 days before this claim. "
+                "This strongly suggests business inactivity rather than an external income shock. "
+                "Have a Trust Squad member vouch for your situation to proceed."
+            ),
+        }
+
+    def calculate_metrics(self, income_history, src_cap, current_income, w_emp=1.0, transaction_count=15, sector_dip=0.0, squad_no_claim_bonus=False, severe_weather_event=False, cash_supplement: float = 0.0):
+
         """
         income_history: list of dicts with 'amount', 'status', and optionally 'category'
         Filters out irregular inflows (Loans, P2P, Chamas) before calculation.
         """
         # 1. Filter Irregular Inflows (Transaction Metadata Isolation)
-        valid_history = [r for r in income_history if r.get('category', 'Revenue') not in ['Loan', 'Chama', 'P2P_Transfer']]
+        valid_history = [
+            r for r in income_history
+            if r.get('category', 'Revenue') not in ['Loan', 'Chama', 'P2P_Transfer', 'P2P_Personal', 'Cashback', 'Reversal']
+        ]
         amounts = [record['amount'] for record in valid_history]
         statuses = [record['status'] for record in valid_history]
 
-        # 1. Mean Income (mu)
+        # 1. Mean Income (mu) — M-Pesa + credibility-weighted cash supplement
         mu = np.mean(amounts) if len(amounts) > 0 else 0
+        # cash_supplement is already credibility-weighted by the caller (1.0, 0.6, or 0.0)
+        mu = mu + cash_supplement
 
         # 2. Standard Deviation (sigma)
         sigma = np.std(amounts, ddof=0) if len(amounts) > 0 else 0

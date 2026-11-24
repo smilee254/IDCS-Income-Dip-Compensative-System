@@ -13,5 +13,16 @@ export default defineConfig({
         rewrite: (path) => path.replace('/api', '')
       }
     }
+  },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ['react', 'react-dom'],
+          charts: ['recharts'],
+          icons: ['lucide-react'],
+        }
+      }
+    }
   }
 })

@@ -14,7 +14,7 @@ from datetime import datetime
 class IncomeData(BaseModel):
     """Schema for individual income transaction"""
     date: str = Field(..., description="Transaction date (YYYY-MM-DD)")
-    amount: float = Field(..., description="Inflow amount (Float)")
+    amount: float = Field(..., gt=0, lt=5000000, description="Inflow amount (Float)")
     description: str = Field(..., description="Source or Details of inflow")
 
     @validator('date')
@@ -74,12 +74,9 @@ class IncomeVisionExtractor:
 
     def extract_inflows(self, file_content: bytes, is_mpesa: bool = True, user_name: Optional[str] = None) -> List[Dict]:
         """
-        Processes PDF and extracts ONLY inflows using Gemini 2.5 Flash.
-        If user_name is provided, it verifies the name exists in the document text.
+        Processes PDF and extracts ONLY inflows using Gemini 2.5 Flash,
+        with strict text sanitization and deterministic RegEx fallback.
         """
-        if not self.model:
-            raise ValueError("Gemini API Key missing in environment variables")
-
         # Extract text for context
         full_texts: List[str] = []
         with pdfplumber.open(io.BytesIO(file_content)) as pdf:
@@ -93,13 +90,35 @@ class IncomeVisionExtractor:
         if user_name and user_name.lower() not in full_text.lower():
             raise ValueError(f"Name Verification Failed: The uploaded document does not contain the registered user name '{user_name}'.")
 
+        # Sanitize against prompt injection: strip instructions and limit length
+        import re
+        sanitized_text = re.sub(r'(?i)(ignore (all )?previous instructions|system prompt|output json only|disregard)', '[FILTERED]', full_text)
+        sanitized_text = sanitized_text[:35000]
+
+        if not self.model:
+            # Deterministic Regex Fallback for standard M-Pesa line statements
+            inflows = []
+            for line in sanitized_text.splitlines():
+                # Matches date YYYY-MM-DD or DD/MM/YYYY and amount
+                date_match = re.search(r'\b(\d{2,4}[-/]\d{2}[-/]\d{2,4})\b', line)
+                amt_match = re.search(r'\b(?:KES|KSH)?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)\b', line)
+                is_credit = any(k in line.lower() for k in ["funds received", "received from", "deposit", "credit", "paybill from"])
+                if date_match and amt_match and is_credit:
+                    try:
+                        clean_amt = float(amt_match.group(1).replace(',', ''))
+                        if 10.0 <= clean_amt <= 5000000.0:
+                            inflows.append({"date": date_match.group(1), "amount": clean_amt, "description": line[:80].strip()})
+                    except Exception:
+                        continue
+            return inflows
+
         prompt = f"""
         Analyze this bank/M-Pesa statement. Identify and extract ONLY 'Money In' (Credit/Deposits). 
         Ignore all 'Debit', 'Withdrawal', or 'Sent' transactions.
         Return a JSON list with 'date', 'amount', and 'description'.
         
         DOCUMENT CONTENT:
-        {full_text}"""
+        {sanitized_text}"""
 
         try:
             response = self.model.generate_content(prompt)
@@ -116,8 +135,20 @@ class IncomeVisionExtractor:
             validated = AIInflowResult(**data)
             return [item.dict() for item in validated.inflows]
         except Exception as e:
-            print(f"AI Vision Error: {e}")
-            return []
+            print(f"AI Vision Error: {e}, attempting deterministic regex fallback...")
+            inflows = []
+            for line in sanitized_text.splitlines():
+                date_match = re.search(r'\b(\d{2,4}[-/]\d{2}[-/]\d{2,4})\b', line)
+                amt_match = re.search(r'\b(?:KES|KSH)?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)\b', line)
+                is_credit = any(k in line.lower() for k in ["funds received", "received from", "deposit", "credit", "paybill from"])
+                if date_match and amt_match and is_credit:
+                    try:
+                        clean_amt = float(amt_match.group(1).replace(',', ''))
+                        if 10.0 <= clean_amt <= 5000000.0:
+                            inflows.append({"date": date_match.group(1), "amount": clean_amt, "description": line[:80].strip()})
+                    except Exception:
+                        continue
+            return inflows
 
     def summarize_data(self, raw_data: List[Dict]) -> str:
         """

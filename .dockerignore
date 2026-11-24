@@ -1,0 +1,44 @@
+# Virtual environments
+env/
+.venv/
+.venve/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Git
+.git/
+.gitignore
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+
+# Node (handled in frontend layer)
+frontend/node_modules/
+frontend/dist/
+
+# Logs & temp files
+*.log
+app.log
+server.log
+stream.out
+temp_mpesa_*.pdf
+temp_bank_*.pdf
+
+# SQLite WAL files (volume-managed at runtime)
+idcs.db-shm
+idcs.db-wal
+
+# Docs / miscellaneous
+*.docx
+*.md
+COUNCIL_LEDGER.txt
+assets/
+passport_0.pdf
